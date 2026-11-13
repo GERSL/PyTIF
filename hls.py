@@ -10,6 +10,7 @@ from rasterio.windows import Window
 from datetime import datetime
 import glob
 import os
+from rasterio.transform import Affine
 
 # Paried bands for L30 and S10, with band names saved
 HSL_BANDS = {
@@ -72,6 +73,42 @@ def _read_sensor(images, sensor, bands, window, cp=1):
                 pass
     return cube
 
+def update_profile_for_resolution(src_profile, src_transform, old_res, new_res):
+    """
+    Updates a rasterio profile and transform for a new target resolution.
+    
+    Args:
+        src_profile (dict): The original rasterio profile.
+        src_transform (Affine): The original affine transform.
+        old_res (float): Native/current resolution in meters/units.
+        new_res (float): Target resolution in meters/units.
+        
+    Returns:
+        tuple: (updated_profile, updated_transform)
+    """
+    profile = src_profile.copy()
+    
+    # Calculate the scaling factor
+    scale_factor = old_res / new_res
+    
+    # New dimensions
+    new_height = int(profile["height"] * scale_factor)
+    new_width = int(profile["width"] * scale_factor)
+    
+    # Scale the affine transform:
+    # transform[0] is pixel width (resolution X)
+    # transform[4] is pixel height (resolution Y, typically negative)
+    new_transform = src_transform * Affine.scale(1.0 / scale_factor, 1.0 / scale_factor)
+    
+    # Update profile fields
+    profile.update(
+        height=new_height,
+        width=new_width,
+        transform=new_transform
+    )
+    
+    return profile, new_transform
+
 def read_image(dir_image, sensor, bands, resolution=10, qa_included=True):
     """Read HLS image data from a directory.
     
@@ -96,6 +133,8 @@ def read_image(dir_image, sensor, bands, resolution=10, qa_included=True):
         tags = src.tags()
         scale_factor = float(tags["scale_factor"])
         add_offset = float(tags["add_offset"])
+        profile = src.profile
+        transform = src.transform
     
     # Adjust dimensions for resolution mismatch
     # L30 bands are 30m native, S10 bands are 10m native
@@ -104,7 +143,12 @@ def read_image(dir_image, sensor, bands, resolution=10, qa_included=True):
         scale = native_resolution // resolution
         height *= scale
         width *= scale
-    
+        # update profile and transform for the new resolution
+        profile, transform = update_profile_for_resolution(profile, transform, native_resolution, resolution)
+        # update tags for the new resolution
+        tags["SPATIAL_RESOLUTION"] = str(resolution)
+        tags["NCOLS"] = str(width)
+        tags["NROWS"] = str(height)
     # Allocate output array
     image_data = np.zeros((len(bands), height, width), dtype=np.float32)
     
@@ -121,7 +165,7 @@ def read_image(dir_image, sensor, bands, resolution=10, qa_included=True):
     else:
         image_qa = []
     
-    return image_data, image_qa
+    return image_data, image_qa, profile, transform, tags
 
 
 def find_hls_images(root, sensor, depth=2):

@@ -1,5 +1,6 @@
 """Create 10 m S10-like images by applying TIF coefficients to L30 scenes."""
 
+import os
 from pathlib import Path
 
 import click
@@ -16,7 +17,7 @@ from utils import generate_tile_chips
 
 NODATA = -9999.0
 
-def load_coefficient_chip(dir_coeff, chip_name, missing_ok=True, format="csv"):
+def load_coefficient_chip(dir_coeff, chip_name, missing_ok=True):
     """
     Load the coefficient table for a specific chip in a tile. Each table is expected to be a CSV file with columns:
     - row: the row index of the chip in the tile
@@ -32,23 +33,13 @@ def load_coefficient_chip(dir_coeff, chip_name, missing_ok=True, format="csv"):
         dir_coeff (str or Path): The directory containing the coefficient files.
         chip_name (str): The name of the chip to load coefficients for.
         missing_ok (bool): If True, missing coefficient files will be ignored; if False, a FileNotFoundError will be raised for any missing files.
-        format (str): The file format of the coefficient files (default is "csv").
         
     Returns:
         pd.DataFrame: A DataFrame containing the coefficients for the specified chip.
     """
     dir_chips = Path(dir_coeff)
-    chip_filename = f"{chip_name}.{format}"
+    chip_filename = f"{chip_name}.parquet"
     chip_filepath = dir_chips.joinpath(chip_filename)
-    
-    # Map format strings to corresponding pandas reader functions
-    readers = {
-        "csv": pd.read_csv,
-        "cvs": pd.read_csv,
-        "parquet": pd.read_parquet,
-    }
-    
-    read_func = readers[format]
     
     if not chip_filepath.is_file():
         if missing_ok:
@@ -56,65 +47,9 @@ def load_coefficient_chip(dir_coeff, chip_name, missing_ok=True, format="csv"):
         else:
             raise FileNotFoundError(f"Missing expected coefficient file: {chip_filepath}")
     
-    coeff_table_chip = read_func(chip_filepath)
+    coeff_table_chip = pd.read_parquet(chip_filepath)
     
     return coeff_table_chip
-
-def load_coefficient(dir, tile_chips, missing_ok=False, format = "cvs"):
-    """
-    Load the coefficient tables for each chip in a tile.  Each table is expected to be a CSV file with columns:
-    - row: the row index of the chip in the tile
-    - col: the column index of the chip in the tile
-    - cluster: the cluster index for the regression model
-    - band: the band name (e.g., "Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2")
-    - centroid_l30: the centroid value of the L30 reflectance for the cluster
-    - intercept: the intercept of the regression model for the cluster
-    - slope: the slope of the regression model for the cluster
-    - QA: the quality assurance flag for the regression model
-    
-    Args:
-        dir (str or Path): The directory containing the coefficient files.
-        tile_chips (list of tuples): A list of tuples, each containing the chip name and its corresponding row and column indices in the tile.
-        missing_ok (bool): If True, missing coefficient files will be ignored; if False, a FileNotFoundError will be raised for any missing files.
-        format (str): The file format of the coefficient files (default is "csv").
-    Returns:
-        list of pd.DataFrame: A list of DataFrames, each containing the coefficients for a chip. The order of the DataFrames corresponds to the order of the tile_chips list.
-        int: The number of missing coefficient files.
-    """
-    dir_chips = Path(dir)
-    coeff_table = []
-    missing = []
-    # Map format strings to corresponding pandas reader functions
-    readers = {
-        "csv": pd.read_csv,
-        "cvs": pd.read_csv,
-        "parquet": pd.read_parquet,
-    }
-    
-    read_func = readers[format]
-    
-    # Iterate over the tile chips and load the corresponding coefficient files
-    for chip_name in tile_chips:
-        chip_name = chip_name[0]  # Extract the chip name from the tuple
-        chip_filename = f"{chip_name}.{format}"
-        chip_filepath = dir_chips.joinpath(chip_filename)
-        if not chip_filepath.is_file():
-            missing.append(chip_name)
-        else:
-            coeff_table_chip = read_func(chip_filepath)
-            if not coeff_table_chip.empty:
-                coeff_table.append(coeff_table_chip)
-    if missing and not missing_ok:
-        raise FileNotFoundError(
-            f"Missing {len(missing)} expected coefficient file(s) in {dir_chips}: "
-            f"{', '.join(missing)}"
-        )
-
-    # Return an empty DataFrame if no tables were loaded
-    if not coeff_table:
-        return pd.DataFrame(), len(missing)  # Return an empty DataFrame and the count of missing files
-    return pd.concat(coeff_table, ignore_index=True), len(missing) # Concatenate all tables into a single DataFrame and reset the index
-
 
 def read_reflectance(path, window):
     """Read HLS scaled reflectance and its valid-data mask."""
@@ -166,7 +101,7 @@ def fuse_chip(table, values, valid, bands, start_row, start_col):
     prediction[~usable] = NODATA
     return np.moveaxis(prediction.reshape(height, width, n_bands), -1, 0).astype(np.float32)
 
-def fuse_image(dir_image, dir_coeff, bands, imagesize, chipsize, output):
+def fuse_image(tile, dir_image, dir_coeff, bands, imagesize, chipsize, output):
     """Fuse L30 bands with coefficients to create S10-like 10m resolution images.
     
     Args:
@@ -178,14 +113,15 @@ def fuse_image(dir_image, dir_coeff, bands, imagesize, chipsize, output):
         output: Output directory to save the fused image.
     """
     # Read L30 bands at once
-    image_data, image_qa = read_image(dir_image, 'L30', bands, resolution=10, qa_included=True)
+    image_filename = Path(dir_image).name
+    image_data, image_qa, profile, transform, tags = read_image(dir_image, 'L30', bands, resolution=10, qa_included=True)
     
     image_chips  = generate_tile_chips(imagesize, chipsize)
 
     # Process each chip
     for chip_name, _,_,_,_ in image_chips:
         # Load the coeff table for this chip
-        chip_coeff_table = load_coefficient_chip(dir_coeff, chip_name, missing_ok=True, format="cvs")
+        chip_coeff_table = load_coefficient_chip(dir_coeff, f"{tile}_{chip_name}", missing_ok=True)
         if len(chip_coeff_table) == 0:
             continue
         # band by band
@@ -240,17 +176,54 @@ def fuse_image(dir_image, dir_coeff, bands, imagesize, chipsize, output):
                 ]
             )
 
-    # xxx
-
+    # save the fused image to output directory, according to the bands
+    image_filename_l10 = image_filename.replace("HLS.L30", "HLS.S10")
+    Path(output).joinpath(image_filename_l10+".part").mkdir(parents=True, exist_ok=True)
+    for ib, band in enumerate(bands):
+        # Get the original band file name from the L30 image directory
+        band_postfix = HSL_BANDS[band][0]  # Assuming L30 band code is the first element
+        band_output_path = Path(output).joinpath(image_filename_l10+".part").joinpath(f"{image_filename_l10}.{band_postfix}.tif")
+        band_output_path.parent.mkdir(parents=True, exist_ok=True)
+        band_output_path_part = band_output_path.with_suffix(".part")
+        with rasterio.open(
+            band_output_path_part,
+            "w",
+            driver="GTiff",
+            height=image_data.shape[1],
+            width=image_data.shape[2],
+            count=1,
+            dtype=np.int16,
+            crs=profile["crs"],
+            transform=transform,
+            nodata=NODATA,
+        ) as dst:
+            # Update metadata tags safely
+            dst.update_tags(**tags)
+            
+            # Convert floating-point image_data back to scaled integer format
+            # Inverse of: loaded = float * scale_factor + add_offset
+            scaled_data = (image_data[ib] - float(tags["add_offset"])) / float(tags["scale_factor"])
+            
+            # Clip/handle nodata and cast to int16
+            output_band_data = np.where(
+                np.isnan(image_data[ib]), 
+                NODATA, 
+                np.round(scaled_data)
+            ).astype(np.int16)
+            
+            dst.write(output_band_data, 1)
+        os.rename(band_output_path_part, band_output_path)
+    os.rename(Path(output).joinpath(image_filename_l10+".part"), Path(output).joinpath(image_filename_l10))
+        
 @click.command()
 @click.option("--tile", default="T18TYM", help="Tile name to filter L30 scenes.")
 @click.option('--bands', default="Blue,Green,Red,NIR,SWIR1,SWIR2", help='Comma-separated list of bands to process')
 @click.option('--imagesize', default=10980, help='Size of the images to process, e.g., 10980 for 10980 by 10980 pixels in 10 meters')
-@click.option('--chipsize', default=60, help='Chip size for processing the images per core, e.g., 180 for 180 by 180 pixels in 10 meters per core')
+@click.option('--chipsize', default=180, help='Chip size for processing the images per core, e.g., 180 for 180 by 180 pixels in 10 meters per core')
 @click.option('--l30', default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Data/L30/T18TYM", help='Directory containing L30 images')
 @click.option("--depth", default=2, show_default=True, help="L30 scene search depth.")
-@click.option('--coeff', default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Output/T18TYM", help='Coefficient output directory')
-@click.option("--output", default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Output/T18TYM_Image", help='Image output directory')
+@click.option('--coeff', default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Output/TIFCoeff/T18TYM", help='Coefficient output directory')
+@click.option("--output", default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Output/TIFImages/T18TYM", help='Image output directory')
 def main(tile, bands, imagesize, chipsize, l30, depth, coeff, output):
     """Generate a 10 m S10-like image for every L30 image."""
     
@@ -264,7 +237,7 @@ def main(tile, bands, imagesize, chipsize, l30, depth, coeff, output):
     Path(output).mkdir(parents=True, exist_ok=True)
     for image in images:
         # dir_image, dir_coeff, bands, imagesize, chipsize, output
-        fuse_image(image, coeff, bands, imagesize, chipsize, output)
+        fuse_image(tile, image, coeff, bands, imagesize, chipsize, output)
 
 
 if __name__ == "__main__":
