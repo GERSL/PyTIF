@@ -10,6 +10,7 @@ from rasterio.windows import Window
 from datetime import datetime
 import glob
 import os
+from rasterio.transform import Affine
 
 # Paried bands for L30 and S10, with band names saved
 HSL_BANDS = {
@@ -22,7 +23,9 @@ HSL_BANDS = {
     "SWIR2": ("B07", "B12"),
 }
 
-def _scene_file(scene, band):
+NODATA = -9999.0
+
+def _image_band_file(scene, band):
     scene = Path(scene)
     return scene / f"{scene.name}.{band}.tif"
 
@@ -52,12 +55,12 @@ def _read_sensor(images, sensor, bands, window, cp=1):
     cube = np.zeros(shape, dtype=np.float32)
     def read_scene(indexed_image):
         time_index, img = indexed_image
-        with rasterio.open(_scene_file(img, "Fmask")) as src:
+        with rasterio.open(_image_band_file(img, "Fmask")) as src:
             fmask = _hls_fmask_qa(src, window)
 
         cube[time_index, -1] = fmask.astype(np.float32)
         for band_index, band in enumerate(bands):
-            with rasterio.open(_scene_file(img, band)) as src:
+            with rasterio.open(_image_band_file(img, band)) as src:
                 tags = src.tags()
                 pixels = src.read(1, window=window, masked=True)
                 cube[time_index, band_index] = (
@@ -72,7 +75,102 @@ def _read_sensor(images, sensor, bands, window, cp=1):
                 pass
     return cube
 
-def find_hls_images(root, sensor, depth=2, bands = "Blue,Green,Red,NIR,SWIR1,SWIR2"):
+def update_profile_for_resolution(src_profile, src_transform, old_res, new_res):
+    """
+    Updates a rasterio profile and transform for a new target resolution.
+    
+    Args:
+        src_profile (dict): The original rasterio profile.
+        src_transform (Affine): The original affine transform.
+        old_res (float): Native/current resolution in meters/units.
+        new_res (float): Target resolution in meters/units.
+        
+    Returns:
+        tuple: (updated_profile, updated_transform)
+    """
+    profile = src_profile.copy()
+    
+    # Calculate the scaling factor
+    scale_factor = old_res / new_res
+    
+    # New dimensions
+    new_height = int(profile["height"] * scale_factor)
+    new_width = int(profile["width"] * scale_factor)
+    
+    # Scale the affine transform:
+    # transform[0] is pixel width (resolution X)
+    # transform[4] is pixel height (resolution Y, typically negative)
+    new_transform = src_transform * Affine.scale(1.0 / scale_factor, 1.0 / scale_factor)
+    
+    # Update profile fields
+    profile.update(
+        height=new_height,
+        width=new_width,
+        transform=new_transform
+    )
+    
+    return profile, new_transform
+
+def read_image(dir_image, sensor, bands, resolution=10, qa_included=True):
+    """Read HLS image data from a directory.
+    
+    Args:
+        dir_image: Directory containing the HLS scene files.
+        sensor: Sensor type ("L30" for Landsat-30 or "S10" for Sentinel-10).
+        bands: List of band names (e.g., ["Red", "NIR", "Blue"]).
+        resolution: Target resolution in meters (10 or 30). Default is 10.
+        qa_included: Whether to include the Fmask QA band. Default is True.
+    
+    Returns:
+        numpy array of shape (num_bands [+ 1 if qa_included], height, width) with float32 data.
+    """
+    # Map band names to file band codes for the sensor
+    band_files = [HSL_BANDS[band][0 if sensor == "L30" else 1] for band in bands]
+    
+    # Determine the image size from the first band file
+    first_band_file = _image_band_file(dir_image, band_files[0])
+    with rasterio.open(first_band_file) as src:
+        height = src.height
+        width = src.width
+        tags = src.tags()
+        scale_factor = float(tags["scale_factor"])
+        add_offset = float(tags["add_offset"])
+        profile = src.profile
+        transform = src.transform
+    
+    # Adjust dimensions for resolution mismatch
+    # L30 bands are 30m native, S10 bands are 10m native
+    native_resolution = 30 if sensor == "L30" else 10
+    if resolution != native_resolution:
+        scale = native_resolution // resolution
+        height *= scale
+        width *= scale
+        # update profile and transform for the new resolution
+        profile, transform = update_profile_for_resolution(profile, transform, native_resolution, resolution)
+        # update tags for the new resolution
+        tags["SPATIAL_RESOLUTION"] = str(resolution)
+        tags["NCOLS"] = str(width)
+        tags["NROWS"] = str(height)
+    # Allocate output array
+    image_data = np.zeros((len(bands), height, width), dtype=np.float32)
+    
+    # Load the image data from each band file
+    for band_idx, (band_name, band_file) in enumerate(zip(bands, band_files)):
+        with rasterio.open(_image_band_file(dir_image, band_file)) as src:
+            pixels = src.read(1, masked=True, out_shape=(height, width))
+            image_data[band_idx] = np.ma.getdata(pixels).astype(np.float32) * scale_factor + add_offset
+    
+    # Load QA/Fmask if requested
+    if qa_included:
+        with rasterio.open(_image_band_file(dir_image, "Fmask")) as src:
+            image_qa = src.read(1, masked=True, out_shape=(height, width))
+    else:
+        image_qa = []
+    
+    return image_data, image_qa, profile, transform, tags
+
+
+def find_hls_images(root, sensor, depth=2):
     """Find image directories for a sensor and return them sorted.
 
     Args:
