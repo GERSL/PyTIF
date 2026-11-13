@@ -72,22 +72,30 @@ def _read_sensor(images, sensor, bands, window, cp=1):
                 pass
     return cube
 
-def find_hls_images(root, sensor, depth=2):
+def find_hls_images(root, sensor, depth=2, bands = "Blue,Green,Red,NIR,SWIR1,SWIR2"):
     """Find image directories for a sensor and return them sorted.
 
     Args:
         root: Root directory to search.
         sensor: Sensor type to match in directory names.
         depth: Number of directory levels to search, starting at root. The default is 2, which means it will search in root (e.g., all images in root), root/* (e.g., all images in <year> of the root).
+        bands: Comma-separated list of bands to include in the search.
     """
+    band_names = [band.strip() for band in bands.split(",")]
+    sensor_band_index = 0 if sensor == "L30" else 1
+    required_bands = [HSL_BANDS[band][sensor_band_index] for band in band_names]
     images = set()
     for level in range(depth):
         pattern = os.path.join(
             root, *(["*"] * level), f"HLS.{sensor}.*.v*"
         )
-        images.update(
-            path for path in glob.glob(pattern) if os.path.isdir(path)
-        )
+        for path in glob.glob(pattern):
+            band_complete = os.path.isdir(path) and all(
+                glob.glob(os.path.join(path, f"*{band}*"))
+                for band in required_bands
+            )
+            if band_complete:
+                images.add(path)
 
     # Get image list acquisition dates
     # Extract raw timestamp strings
