@@ -2,20 +2,13 @@
 
 import os
 from pathlib import Path
-
 import click
 import numpy as np
 import pandas as pd
 import rasterio
-from affine import Affine
-from rasterio.windows import Window
 import time
-
-from hls import HSL_BANDS, find_hls_images, read_image
+from hls import HSL_BANDS, NODATA, find_hls_images, read_image
 from utils import generate_tile_chips
-
-
-NODATA = -9999.0
 
 def load_coefficient_chip(dir_coeff, chip_name, missing_ok=True):
     """
@@ -51,57 +44,7 @@ def load_coefficient_chip(dir_coeff, chip_name, missing_ok=True):
     
     return coeff_table_chip
 
-def read_reflectance(path, window):
-    """Read HLS scaled reflectance and its valid-data mask."""
-    with rasterio.open(path) as src:
-        pixels = src.read(1, window=window, masked=True)
-        scale = float(src.tags().get("scale_factor", 1.0))
-        offset = float(src.tags().get("add_offset", 0.0))
-    return (np.ma.getdata(pixels).astype(np.float32) * scale + offset,
-            ~np.ma.getmaskarray(pixels))
-
-
-def fuse_chip(table, values, valid, bands, start_row, start_col):
-    """Select the nearest multi-band L30 centroid and evaluate its model."""
-    height, width = values.shape[1:]
-    output = np.full((len(bands), height, width), NODATA, dtype=np.float32)
-    # QA 3 is the converged robust fit emitted by coeff_generate.py.
-    table = table[(table["QA"] == 3) & np.isfinite(table["cluster"])].copy()
-    table["band"] = table["band"].str.lower()
-    wanted = [band.lower() for band in bands]
-    table = table[table["band"].isin(wanted)]
-    if table.empty:
-        return output
-
-    # Use the filename's chip origin, rather than the first valid model row:
-    # a leading pixel can legitimately have QA=0 and be absent after filtering.
-    table["r"] = table["row"].astype(int) - start_row
-    table["c"] = table["col"].astype(int) - start_col
-    table = table[table.r.between(0, height - 1) & table.c.between(0, width - 1)]
-    clusters = np.sort(table.cluster.unique())
-    n_pixels, n_clusters, n_bands = height * width, len(clusters), len(bands)
-    centroid = np.full((n_pixels, n_clusters, n_bands), np.nan, dtype=np.float32)
-    intercept = centroid.copy()
-    slope = centroid.copy()
-    cluster_ids = {cluster: index for index, cluster in enumerate(clusters)}
-    band_ids = {band: index for index, band in enumerate(wanted)}
-    for item in table[["r", "c", "cluster", "band", "centroid_l30", "intercept", "slope"]].itertuples(index=False):
-        r, c, cluster, band, center, offset, gain = item
-        pixel, k, b = int(r) * width + int(c), cluster_ids[cluster], band_ids[band]
-        centroid[pixel, k, b], intercept[pixel, k, b], slope[pixel, k, b] = center, offset, gain
-
-    observed = np.moveaxis(values, 0, -1).reshape(n_pixels, n_bands)
-    finite_model = np.isfinite(centroid).all(2) & np.isfinite(intercept).all(2) & np.isfinite(slope).all(2)
-    distance = np.sum((centroid - observed[:, None]) ** 2, axis=2)
-    distance[~finite_model] = np.inf
-    chosen = np.argmin(distance, axis=1)
-    rows = np.arange(n_pixels)
-    prediction = intercept[rows, chosen] + slope[rows, chosen] * observed
-    usable = valid.all(0).reshape(n_pixels) & np.isfinite(distance[rows, chosen])
-    prediction[~usable] = NODATA
-    return np.moveaxis(prediction.reshape(height, width, n_bands), -1, 0).astype(np.float32)
-
-def fuse_image(tile, dir_image, dir_coeff, bands, imagesize, chipsize, output):
+def fuse_l30_to_l10(tile, dir_image, dir_coeff, bands, imagesize, chipsize, output):
     """Fuse L30 bands with coefficients to create S10-like 10m resolution images.
     
     Args:
@@ -237,7 +180,7 @@ def main(tile, bands, imagesize, chipsize, l30, depth, coeff, output):
     Path(output).mkdir(parents=True, exist_ok=True)
     for image in images:
         # dir_image, dir_coeff, bands, imagesize, chipsize, output
-        fuse_image(tile, image, coeff, bands, imagesize, chipsize, output)
+        fuse_l30_to_l10(tile, image, coeff, bands, imagesize, chipsize, output)
 
 
 if __name__ == "__main__":

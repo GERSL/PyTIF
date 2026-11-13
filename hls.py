@@ -23,6 +23,8 @@ HSL_BANDS = {
     "SWIR2": ("B07", "B12"),
 }
 
+NODATA = -9999.0
+
 def _image_band_file(scene, band):
     scene = Path(scene)
     return scene / f"{scene.name}.{band}.tif"
