@@ -699,8 +699,8 @@ def main(tile, bands, l30, s10, output, imagesize, chipsize, ji, jn, cp, debug):
     validate_chip_size(imagesize, chipsize)
 
     # Find images for L30 and S10 sensors
-    image_list_l30, date_list_l30 = find_hls_images(l30, "L30")
-    image_list_s10, date_list_s10 = find_hls_images(s10, "S10")
+    image_list_l30, date_list_l30 = find_hls_images(l30, "L30", bands=bands)
+    image_list_s10, date_list_s10 = find_hls_images(s10, "S10", bands=bands)
     print(f">> # of L30 images found: {len(image_list_l30)}")
     print(f">> # of S10 images found: {len(image_list_s10)}")
     # shuffle the image lists to ensure that the processing is balanced across jobs

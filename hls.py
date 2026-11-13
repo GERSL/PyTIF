@@ -170,7 +170,8 @@ def read_image(dir_image, sensor, bands, resolution=10, qa_included=True):
     return image_data, image_qa, profile, transform, tags
 
 
-def find_hls_images(root, sensor, depth=2):
+
+def find_hls_images(root, sensor, depth=2, bands = "Blue,Green,Red,NIR,SWIR1,SWIR2"):
     """Find image directories for a sensor and return them sorted.
 
     Args:
