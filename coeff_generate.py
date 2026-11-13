@@ -46,23 +46,7 @@ import numpy as np
 import pandas as pd
 from hls import find_hls_images, read_hls_cube
 from sklearn.cluster import KMeans
-
-def generate_chip_windows(image_size, chip_size):
-    """Return chips as (name, start_row, start_col, end_row, end_col).
-
-    End coordinates are exclusive. Edge chips may be smaller than chip_size.
-    """
-    return [
-        (
-            f"chip_{row:06d}_{col:06d}_{min(row + chip_size, image_size):06d}_{min(col + chip_size, image_size):06d}",
-            row,
-            col,
-            min(row + chip_size, image_size),
-            min(col + chip_size, image_size),
-        )
-        for row in range(0, image_size, chip_size)
-        for col in range(0, image_size, chip_size)
-    ]
+from utils import generate_tile_chips
 
 def validate_chip_size(imagesize: int, chipsize: int) -> None:
     """
@@ -731,7 +715,7 @@ def main(tile, bands, l30, s10, output, imagesize, chipsize, ji, jn, cp, debug):
     date_list_s10 = np.array([date_list_s10[i] for i in idx_random_s10])
 
     # Split the extent of the image into parts with the defined chipsize
-    chip_list = generate_chip_windows(imagesize, chipsize) # chip name, starting row, staring column, ending row, ending column
+    chip_list = generate_tile_chips(imagesize, chipsize) # chip name, starting row, staring column, ending row, ending column
     random.seed(42)  # Set a seed for reproducibility
     random.shuffle(chip_list) # Shuffle the chip_list to ensure that the processing is balanced across jobs
     
