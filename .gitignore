@@ -1,4 +1,4 @@
-job/
+job/log/
 __pycache__/
 *.pyc
 *.pyo
