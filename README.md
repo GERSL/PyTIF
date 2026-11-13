@@ -80,6 +80,25 @@ The standard workflow writes a CSV table of per-pixel, per-band model
 coefficients and quality fields for each processed chip. Chip output filenames
 currently use the `.cvs` extension.
 
+## Fuse L30 scenes to 10 m S10-like images
+
+After generating coefficients, apply them to every L30 scene with:
+
+```bash
+python fusion.py \
+  --l30 /data/HLS/L30/T18TYM \
+  --coefficients ./output \
+  --output ./fused
+```
+
+This creates one `<L30-scene>_S10like.tif` per L30 scene. Each GeoTIFF is on
+the 10 m grid (nearest-neighbour expansion of the L30 grid) and contains the
+requested bands in the same order as `--bands`. For every output pixel the
+fusion step selects the converged coefficient cluster whose L30 centroid is
+nearest across all bands, then applies that cluster's intercept and slope.
+Pixels without a converged model or valid L30 input are written as `-9999`.
+Both `.csv` and the historical `.cvs` coefficient filenames are accepted.
+
 ## Reference
 
 Song, K., Zhu, Z., Qiu, S., Olofsson, P., Neigh, C. S., Ju, J., & Zhou, Q.

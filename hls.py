@@ -22,7 +22,7 @@ HSL_BANDS = {
     "SWIR2": ("B07", "B12"),
 }
 
-def _scene_file(scene, band):
+def _image_band_file(scene, band):
     scene = Path(scene)
     return scene / f"{scene.name}.{band}.tif"
 
@@ -52,12 +52,12 @@ def _read_sensor(images, sensor, bands, window, cp=1):
     cube = np.zeros(shape, dtype=np.float32)
     def read_scene(indexed_image):
         time_index, img = indexed_image
-        with rasterio.open(_scene_file(img, "Fmask")) as src:
+        with rasterio.open(_image_band_file(img, "Fmask")) as src:
             fmask = _hls_fmask_qa(src, window)
 
         cube[time_index, -1] = fmask.astype(np.float32)
         for band_index, band in enumerate(bands):
-            with rasterio.open(_scene_file(img, band)) as src:
+            with rasterio.open(_image_band_file(img, band)) as src:
                 tags = src.tags()
                 pixels = src.read(1, window=window, masked=True)
                 cube[time_index, band_index] = (
@@ -71,6 +71,58 @@ def _read_sensor(images, sensor, bands, window, cp=1):
             for _ in executor.map(read_scene, enumerate(images)):
                 pass
     return cube
+
+def read_image(dir_image, sensor, bands, resolution=10, qa_included=True):
+    """Read HLS image data from a directory.
+    
+    Args:
+        dir_image: Directory containing the HLS scene files.
+        sensor: Sensor type ("L30" for Landsat-30 or "S10" for Sentinel-10).
+        bands: List of band names (e.g., ["Red", "NIR", "Blue"]).
+        resolution: Target resolution in meters (10 or 30). Default is 10.
+        qa_included: Whether to include the Fmask QA band. Default is True.
+    
+    Returns:
+        numpy array of shape (num_bands [+ 1 if qa_included], height, width) with float32 data.
+    """
+    # Map band names to file band codes for the sensor
+    band_files = [HSL_BANDS[band][0 if sensor == "L30" else 1] for band in bands]
+    
+    # Determine the image size from the first band file
+    first_band_file = _image_band_file(dir_image, band_files[0])
+    with rasterio.open(first_band_file) as src:
+        height = src.height
+        width = src.width
+        tags = src.tags()
+        scale_factor = float(tags["scale_factor"])
+        add_offset = float(tags["add_offset"])
+    
+    # Adjust dimensions for resolution mismatch
+    # L30 bands are 30m native, S10 bands are 10m native
+    native_resolution = 30 if sensor == "L30" else 10
+    if resolution != native_resolution:
+        scale = native_resolution // resolution
+        height *= scale
+        width *= scale
+    
+    # Allocate output array
+    image_data = np.zeros((len(bands), height, width), dtype=np.float32)
+    
+    # Load the image data from each band file
+    for band_idx, (band_name, band_file) in enumerate(zip(bands, band_files)):
+        with rasterio.open(_image_band_file(dir_image, band_file)) as src:
+            pixels = src.read(1, masked=True, out_shape=(height, width))
+            image_data[band_idx] = np.ma.getdata(pixels).astype(np.float32) * scale_factor + add_offset
+    
+    # Load QA/Fmask if requested
+    if qa_included:
+        with rasterio.open(_image_band_file(dir_image, "Fmask")) as src:
+            image_qa = src.read(1, masked=True, out_shape=(height, width))
+    else:
+        image_qa = []
+    
+    return image_data, image_qa
+
 
 def find_hls_images(root, sensor, depth=2):
     """Find image directories for a sensor and return them sorted.

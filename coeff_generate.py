@@ -36,8 +36,7 @@ Last updated:
 # conda install click -y
 # conda install numpy -y
 # conda install scikit-learn -y
-
-import glob
+# conda install pyarrow -y # for pandas to read parquet files, which is faster than csv
 import os
 import click
 import random
@@ -47,7 +46,6 @@ import numpy as np
 import pandas as pd
 from hls import find_hls_images, read_hls_cube
 from sklearn.cluster import KMeans
-import warnings
 
 def generate_chip_windows(image_size, chip_size):
     """Return chips as (name, start_row, start_col, end_row, end_col).
@@ -101,7 +99,7 @@ def validate_chip_size(imagesize: int, chipsize: int) -> None:
             f"image size ({imagesize}) perfectly. Try using a close valid size like: {suggestions_str}."
         )
     
-def construct_pairs(pixel_ts_l30, pixel_dates_l30, pixel_ts_s10, pixel_dates_s10, day_tolerance=16):
+def select_pairs(pixel_ts_l30, pixel_dates_l30, pixel_ts_s10, pixel_dates_s10, day_tolerance=16):
     """
     Find matched observations and return X, Y arrays for linear regression.
     
@@ -181,7 +179,8 @@ def evaluate_gap_clusters(pair_data, maxK, n_reference=100, random_state=42):
     standard_errors = np.empty(maxK)
     models = []
     for i, k in enumerate(k_values):
-        model = KMeans(n_clusters=k, n_init=10, random_state=random_state)
+        # model = KMeans(n_clusters=k, n_init=10, random_state=random_state) # this produced same results as MATLAB's kmeans
+        model = KMeans(n_clusters=k, n_init=1, init='k-means++', tol=1e-4, random_state=random_state)
         model.fit(data)
         models.append(model)
 
@@ -196,11 +195,8 @@ def evaluate_gap_clusters(pair_data, maxK, n_reference=100, random_state=42):
             reference_rotated = rng.uniform(lower, upper, size=rotated.shape)
             reference = reference_rotated @ components + mean
 
-            reference_model = KMeans(
-                n_clusters=k,
-                n_init=10,
-                random_state=int(rng.integers(0, 2**31 - 1)),
-            )
+            # reference_model = KMeans(n_clusters=k, n_init=10, random_state=int(rng.integers(0, 2**31 - 1)),) # this produced same results as MATLAB's kmeans
+            reference_model = KMeans(n_clusters=k, n_init=1, init='k-means++', tol=1e-4, random_state=int(rng.integers(0, 2**31 - 1)),)
             reference_model.fit(reference)
 
             if reference_model.inertia_ <= 0:
@@ -223,16 +219,14 @@ def evaluate_gap_clusters(pair_data, maxK, n_reference=100, random_state=42):
     optimal_centroid = optimal_centroid.reshape(optimal_k, 2, nbands) # n_bands is the number of bands in the pair_data
     return optimal_k, optimal_cluster, optimal_centroid, k_values, standard_errors, gaps
 
-def load_test_data():
-    # Load test data from testdata, by loading the txt
-    # The test data were gotten from the orginal MATLAB code, Line 228-229, runTIF_par_clb_v4.m
-    # In Matlab, debug at line 228-229, and save the sdate_L, sdate_S, line_t_L, line_t_S to txt files
-    # to get the current dir
-    dir_script = os.path.dirname(os.path.realpath(__file__))
-    date_list_l30 = np.loadtxt(os.path.join(dir_script, "testdata/sdate_L.txt"))
-    date_list_s10 = np.loadtxt(os.path.join(dir_script, "testdata/sdate_S.txt"))
-    pixel_ts_l30 = np.loadtxt(os.path.join(dir_script, "testdata/line_t_L.txt"))
-    pixel_ts_s10 = np.loadtxt(os.path.join(dir_script, "testdata/line_t_S.txt"))
+def load_test_data(test_file):
+    # Load test data from testdata, following the MATLAB structure of the test data.
+    from scipy.io import loadmat
+    mat_data = loadmat(test_file)
+    date_list_l30 = mat_data["SAMPLES"]["sdate_L"][0][0].flatten()
+    date_list_s10 = mat_data["SAMPLES"]["sdate_S"][0][0].flatten()
+    pixel_ts_l30 = mat_data["SAMPLES"]["line_t_L"][0][0] 
+    pixel_ts_s10 = mat_data["SAMPLES"]["line_t_S"][0][0]
     
     # convert to datetime objects, by days, to satify the requirement of finding pairs
     from datetime import datetime, timedelta
@@ -244,14 +238,12 @@ def load_test_data():
     date_list_l30 = np.array(date_list_l30)
     date_list_s10 = np.array(date_list_s10)
 
-
     pixel_ts_l30 = np.array(pixel_ts_l30, dtype=np.float64) # convert the pixel_ts to numpy array
     pixel_ts_s10 = np.array(pixel_ts_s10, dtype=np.float64) # convert the pixel_ts to numpy array
     # Keep the first 6 bands (columns :6) and the last column (-1) as fmask
     pixel_ts_l30 = np.hstack((pixel_ts_l30[:, :6]/10000.0, pixel_ts_l30[:, [-1]]))
     pixel_ts_s10 = np.hstack((pixel_ts_s10[:, :6]/10000.0, pixel_ts_s10[:, [-1]]))
     return pixel_ts_l30, date_list_l30, pixel_ts_s10, date_list_s10
-
 
 def robust_fit(x, y, weight, max_iter=50, tol=None):
     """
@@ -553,6 +545,16 @@ def fit_linear_model(pair_data, pair_delta_t, idx_cluster):
         r_squareds[ib] = r_squared
     return coeffs, r_squareds, converged
 
+def filter_invalid(pixel_ts, pixel_dates):
+    """Filter out invalid observations based on fmask and reflectance range."""
+    idx_valid = pixel_ts[:, -1] < 2  # fmask < 2, valid pixels
+    pixel_ts = pixel_ts[:, :-1]  # remove the fmask band, which is not used anymore
+    idx_valid &= (
+        (pixel_ts.min(axis=1) > 0)
+        & (pixel_ts.max(axis=1) < 1.0)
+    )  # reflectance values are within the valid range
+    return pixel_ts[idx_valid], pixel_dates[idx_valid]
+
 def process_pixel(
     coordinates,
     cube_l30,
@@ -569,29 +571,15 @@ def process_pixel(
     pixel_ts_l30 = cube_l30[:, :, row // 3, col // 3]
     pixel_ts_s10 = cube_s10[:, :, row, col]
 
-    idx_valid_l30 = pixel_ts_l30[:, -1] < 2
-    idx_valid_s10 = pixel_ts_s10[:, -1] < 2
-    pixel_ts_l30 = pixel_ts_l30[:, :-1]
-    pixel_ts_s10 = pixel_ts_s10[:, :-1]
-    idx_valid_l30 &= (
-        (pixel_ts_l30.min(axis=1) > 0)
-        & (pixel_ts_l30.max(axis=1) < 1.0)
-    )
-    idx_valid_s10 &= (
-        (pixel_ts_s10.min(axis=1) > 0)
-        & (pixel_ts_s10.max(axis=1) < 1.0)
-    )
+    # Filter out invalid pixels based on fmask and reflectance range
+    pixel_ts_l30, date_list_l30 = filter_invalid(pixel_ts_l30, date_list_l30)
+    pixel_ts_s10, date_list_s10 = filter_invalid(pixel_ts_s10, date_list_s10)
 
-    pixel_ts_l30 = pixel_ts_l30[idx_valid_l30]
-    pixel_ts_s10 = pixel_ts_s10[idx_valid_s10]
-    pixel_dates_l30 = date_list_l30[idx_valid_l30]
-    pixel_dates_s10 = date_list_s10[idx_valid_s10]
-
-    pair_data, pair_delta_t = construct_pairs(
+    pair_data, pair_delta_t = select_pairs(
         pixel_ts_l30,
-        pixel_dates_l30,
+        date_list_l30,
         pixel_ts_s10,
-        pixel_dates_s10,
+        date_list_s10,
     )
     if pair_data.shape[0] < 3:
         for band in bands:
@@ -662,13 +650,13 @@ def process_pixel(
 @click.option('--bands', default="Blue,Green,Red,NIR,SWIR1,SWIR2", help='Comma-separated list of bands to process')
 @click.option('--l30', default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Data/L30/T18TYM", help='Directory containing L30 images')
 @click.option('--s10', default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Data/S10/T18TYM", help='Directory containing S10 images')
-@click.option('--output', default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Output/T18TYM", help='Output directory for fused images')
+@click.option('--output', default="/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/Output/TIFCoeff/T18TYM", help='Output directory for fused images')
 @click.option('--imagesize', default=10980, help='Size of the images to process, e.g., 10980 for 10980 by 10980 pixels in 10 meters')
-@click.option('--chipsize', default=60, help='Chip size for processing the images per core, e.g., 180 for 180 by 180 pixels in 10 meters per core')
+@click.option('--chipsize', default=180, help='Chip size for processing the images per core, e.g., 180 for 180 by 180 pixels in 10 meters per core')
 @click.option('--ji', default=1, help='Job ID to use for processing, e.g., 1, 2, 3, etc.')
 @click.option('--jn', default=1, help='Total number of jobs to split the processing into, e.g., 12 for 12 jobs')
 @click.option('--cp', default=1, help='Number of CPU cores per job to use for processing, e.g., 12 for 12 cores')
-@click.option('--debug', is_flag=False, help='Run the built-in single-pixel test-data workflow.')
+@click.option('--debug', default=False, help='Run the built-in single-pixel test-data workflow.')
 def main(tile, bands, l30, s10, output, imagesize, chipsize, ji, jn, cp, debug):
     # Recording the start time of the processing
     start_time = time.time()
@@ -687,53 +675,44 @@ def main(tile, bands, l30, s10, output, imagesize, chipsize, ji, jn, cp, debug):
     print(f">> Mode: {'debug' if debug else 'standard'}")
 
     if debug:
-        debug_bands = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
-        if bands != debug_bands:
-            raise click.BadParameter(
-                "debug mode requires the default band order: "
-                f"{', '.join(debug_bands)}",
-                param_hint="--bands",
-            )
+        # Need to define the directory for the test data, which is used for debugging and testing the code.
+        dir_data = "/gpfs/sharedfs1/zhulab/Shi/ProjectHLS10/TIF/CodeMatlab/TestData/13TCF/CalibrationSamplesTS"
+        dir_out = dir_data + "TIFCoeffDebug"
+        # Force the bands to the default set for debug mode, as the test data is based on these bands.
+        bands = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
+        
+        # Search for the test data files with .mat
+        import glob
+        test_data_files = glob.glob(os.path.join(dir_data, "*30to10*.mat"))
+        test_data_files.sort()  # Sort the files for consistent processing order
+        # NEED to Sort the matlab code in Line 144, runTIF_par_clb_v4.m, to keep same order, using codes bellows:
+        # [~, sortedIdx] = sort({sampleTS.name});
+        # sampleTS = sampleTS(sortedIdx);
 
-        test_data_dir = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)),
-            "testdata",
-        )
-        test_data_paths = [
-            os.path.join(test_data_dir, name)
-            for name in ("sdate_L.txt", "sdate_S.txt", "line_t_L.txt", "line_t_S.txt")
-        ]
-        missing_paths = [path for path in test_data_paths if not os.path.isfile(path)]
-        if missing_paths:
-            raise click.ClickException(
-                "Debug mode requires these test-data files: "
-                + ", ".join(missing_paths)
+        for test_file in test_data_files:
+            print(">> Loading the built-in test data for one pixel.")
+            pixel_ts_l30, pixel_dates_l30, pixel_ts_s10, pixel_dates_s10 = (
+                load_test_data(test_file)
             )
-
-        print(">> Loading the built-in test data for one pixel.")
-        pixel_ts_l30, pixel_dates_l30, pixel_ts_s10, pixel_dates_s10 = (
-            load_test_data()
-        )
-        _, _, debug_results = process_pixel(
-            (0, 0),
-            pixel_ts_l30[:, :, np.newaxis, np.newaxis],
-            pixel_ts_s10[:, :, np.newaxis, np.newaxis],
-            pixel_dates_l30,
-            pixel_dates_s10,
-            bands,
-            0,
-            0,
-        )
-        os.makedirs(output, exist_ok=True)
-        debug_output_path = os.path.join(output, f"tif_debug_results_{tile}.csv")
-        pd.DataFrame(debug_results).to_csv(debug_output_path, index=False)
-        print(f">> Saved debug results to {debug_output_path}")
-        return
+            _, _, debug_results = process_pixel(
+                (0, 0),
+                pixel_ts_l30[:, :, np.newaxis, np.newaxis],
+                pixel_ts_s10[:, :, np.newaxis, np.newaxis],
+                pixel_dates_l30,
+                pixel_dates_s10,
+                bands,
+                0,
+                0,
+            )
+            os.makedirs(dir_out, exist_ok=True)
+            debug_output_path = os.path.join(dir_out, f"debug_{os.path.basename(test_file).replace('.mat', '.csv')}")
+            pd.DataFrame(debug_results).to_csv(debug_output_path, index=False)
+            print(f">> Saved debug results to {debug_output_path}")
+            
 
     # Check if the selected size is divisible by the image resolutions, 10, 20, and 30 meters, 
     # and at the same time, check if image size is divisible by chip size, if not, raise an error
     validate_chip_size(imagesize, chipsize)
-
 
     # Find images for L30 and S10 sensors
     image_list_l30, date_list_l30 = find_hls_images(l30, "L30")
@@ -765,21 +744,19 @@ def main(tile, bands, l30, s10, output, imagesize, chipsize, ji, jn, cp, debug):
     for chip in chip_list:
         chip_name, start_row, start_col, end_row, end_col = chip
 
-        tif_output_path = os.path.join(output, f"{chip_name}.cvs")
+        tif_output_path = os.path.join(output, f"{tile}_{chip_name}.parquet")
         if os.path.exists(tif_output_path):
             print(
                 f">> Output for chip {chip_name} already exists"
             )
             continue
-        tif_coeffs = []
 
-        # Here you would implement the logic to process each chip
-        # For example, you might want to extract the relevant portion of the images
-        # and then call fusion_tif on those portions.
         print(
             f">> Processing rows {start_row}-{end_row}, "
             f"columns {start_col}-{end_col}"
         )
+        
+        tif_coeffs = [] # final results for this chip, which will be saved to a parquet file
  
         start_time_chip = time.time()
         # Read the time series of chips for L30 and S10 images
@@ -788,6 +765,7 @@ def main(tile, bands, l30, s10, output, imagesize, chipsize, ji, jn, cp, debug):
             start_row, start_col, end_row, end_col, cp=cp,
         )
 
+        # define a partial function to process each pixel with the fixed parameters
         processer = partial(
             process_pixel,
             cube_l30=cube_l30,
@@ -800,17 +778,20 @@ def main(tile, bands, l30, s10, output, imagesize, chipsize, ji, jn, cp, debug):
         )
         for row in range(cube_s10.shape[2]):
             for col in range(cube_s10.shape[3]):
+                #start_time_pixel = time.time()
                 _, _, pixel_results = processer((row, col))
                 tif_coeffs.extend(pixel_results)
-                # print(f">> The {row+1}th in row & {col+1} processed in {(time.time() - start_time_chip):.2f} seconds")
+                #print(f">> The {row+1}th in row & {col+1} processed in {(time.time() - start_time_pixel):.2f} seconds")
 
+        os.makedirs(output, exist_ok=True) # Create the output directory if it does not exist
 
-        os.makedirs(output, exist_ok=True)
-        pd.DataFrame(tif_coeffs).to_csv(tif_output_path, index=False)
+        # saving the results to parquet format for better performance and compression for Python
+        pd.DataFrame(tif_coeffs).to_parquet(tif_output_path, engine="pyarrow", compression="snappy")
         print(
             f">> Saved TIF coefficients to {tif_output_path}"
         )
         print(f">> Elapsed processing time in {(time.time() - start_time_chip) / 60:.2f} minutes")
+    print(f"> Total elapsed processing time: {(time.time() - start_time) / 60:.2f} minutes")
 
 if __name__ == "__main__":
     main()
