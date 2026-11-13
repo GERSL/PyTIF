@@ -6,6 +6,8 @@ and Sentinel-2 (S10) surface-reflectance observations by date, clusters the
 matched observations, and fits robust per-band regression models. Processing
 is organized into spatial chips.
 
+## NOTICE: This is currently under development; not released yet!
+
 ## Requirements
 
 Use Python with the following packages installed:
