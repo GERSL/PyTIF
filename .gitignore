@@ -1,6 +1,6 @@
-*.err
-*.out
 __pycache__/
 *.pyc
 *.pyo
+*.err
+*.out
 .DS_Store
